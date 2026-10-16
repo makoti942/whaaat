@@ -32,7 +32,7 @@ npm run preview
 - Labels actual observations `DERIV_ACTUAL`; labels locally generated records separately as simulated. These streams are not merged.
 - Caches actual market history in browser IndexedDB (up to 1,000 ticks per symbol in the intake cache). Extended research data—up to 10,000 actual ticks per symbol, up to 1,000 generated ticks per symbol, model snapshots, forecast records, prospective evaluations, and diagnostics—is stored in separate IndexedDB stores.
 - Storage is local to the browser and origin. It is not a server database or cross-device sync; clearing browser data removes the local copy. Export research state regularly if it needs to be retained elsewhere.
-- Unexpected WebSocket closures trigger capped exponential-backoff reconnection. Users can also disconnect or reconnect explicitly.
+- WebSocket pings, live-tick freshness monitoring, automatic subscription refresh, and capped exponential-backoff reconnection help recover a quiet/stale feed. The UI distinguishes an open socket from recent incoming market ticks.
 
 History availability and lengths depend on Deriv's current active-symbol catalogue, API limits, network connectivity, and provider responses. Individual history failures and loaded counts are exposed in the interface.
 
@@ -41,14 +41,14 @@ History availability and lengths depend on Deriv's current active-symbol catalog
 - **Overview:** selected-market stream, history readiness, and clearly separated actual and generated price traces.
 - **Tick explorer:** filter actual/generated observations by symbol, source, digit, direction, time range, quote or tick ID, and forecast ID.
 - **Behavior lab:** digit frequencies, conditional digit transitions, price-movement summaries, rolling windows, and distribution drift, calculated from actual records.
-- **Local generator:** offline simulation or live-learning mode using a Web Worker when supported; generated values are stored and labelled independently.
+- **Local generator:** starts automatically once the selected symbol has enough actual training data; supports an adaptive mimic, empirical distribution mimic, repeat-last-digit baseline, and explicit low-probability pattern stress test. It runs offline or in live-learning mode, uses a Web Worker when supported, and stores generated values separately.
 - **Forecast centre:** issue immutable, finite-horizon forecasts from the current actual-data model or a frequency baseline. A later actual tick is used to score a forecast; generated data never counts as an outcome.
 - **Learning and accuracy:** per-symbol model readiness, version events, diagnostics, and prospective metrics with denominators and baseline comparisons. Insufficient sample sizes are shown as insufficient evidence rather than invented performance.
 - **Symbol manager and settings:** per-symbol status, rolling windows, model prior strength, validation-window setting, reset controls, and JSON import/export.
 
 ## Integrity and interpretation
 
-The model is an experimental statistical baseline, not a guarantee that tick digits or prices are predictable. Forecasts are frozen when issued and evaluated prospectively; no future actual tick is used to construct the saved forecast. Accuracy and calibration should be interpreted only with adequate independent observations and suitable validation. There is no trade execution, account authentication, or financial recommendation functionality.
+The model is an experimental statistical baseline, not a guarantee that tick digits or prices are predictable. Pattern stress is a local test that deliberately selects unlikely outcomes; it cannot influence Deriv or establish a break in Deriv's generator. Forecasts are frozen when issued and evaluated prospectively; no future actual tick is used to construct the saved forecast. Accuracy and calibration should be interpreted only with adequate independent observations and suitable validation. There is no trade execution, account authentication, or financial recommendation functionality.
 
 ## Tests
 

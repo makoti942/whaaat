@@ -13,7 +13,7 @@ export class ForecastBook {
     const last = actual.at(-1);
     const forecast = {
       id: `${symbol}:${createdAt}:${this.forecasts.length + 1}`, symbol, source: 'LOCAL_PREDICTED',
-      createdAt, issueEpoch: Number(last.epoch), issueTickId: last.id, issueActualCount: actual.length,
+      createdAt, issueEpoch: Number(last.epoch), issueTickId: last.id, issueSequence: Number(last.sequence) || null, issueActualCount: actual.length,
       modelVersion: snapshot.version, method, horizon: predictions.length, status: 'PENDING',
       scoringCount: 0, baselineProbabilities: [...baselineProbabilities], baselineDigit: baselineProbabilities.indexOf(Math.max(...baselineProbabilities)),
       predictions: predictions.map(item => ({ ...item, distribution: [...item.distribution] })),
@@ -26,13 +26,18 @@ export class ForecastBook {
     if (!validActual(tick)) return [];
     const newlyScored = [];
     for (const forecast of this.forecasts) {
-      if (forecast.symbol !== tick.symbol || Number(tick.epoch) <= forecast.issueEpoch || Number(tick.arrival || 0) < forecast.createdAt) continue;
+      if (forecast.symbol !== tick.symbol || Number(tick.arrival || 0) < forecast.createdAt || tick.id === forecast.issueTickId) continue;
+      const isAfterIssue = Number.isFinite(Number(tick.sequence)) && forecast.issueSequence != null
+        ? Number(tick.sequence) > forecast.issueSequence
+        : Number(tick.epoch) > forecast.issueEpoch;
+      if (!isAfterIssue || forecast.scoringCount >= forecast.horizon) continue;
       // Exchange epochs may have gaps; scoring advances only when a new actual message arrives.
       if (forecast.lastScoredTickId === tick.id) continue;
       forecast.lastScoredTickId = tick.id;
-      const step = ++forecast.scoringCount;
+      const step = forecast.scoringCount + 1;
       const prediction = forecast.predictions[step - 1];
       if (!prediction) continue;
+      forecast.scoringCount = step;
       const actualDigit = Number.isInteger(tick.digit) ? tick.digit : finalDigit(tick.quote);
       const predictedDigit = prediction.digit;
       const correctDigit = actualDigit === predictedDigit;

@@ -16,16 +16,17 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   const models = new Map(), profiles = new Map(), generated = new Map(), status = new Map(), trainingData = new Map();
   let forecasts = new ForecastBook(), timer = 0, started = false, paused = false, generatedTotal = 0;
   let recentEventRows = [], lastRender = 0, renderTimer = 0, droppedGenerationRequests = 0;
-  let generatorWorker = null, workerSymbol = null, workerReady = false, workerBusy = false;
+  let generatedWriteQueue = [], generatedWriteTimer = 0, generatorRenderTimer = 0, lastGeneratorRender = 0;
+  let generatorWorker = null, workerSymbol = null, workerReady = false, workerBusy = false, workerBusySince = 0, autoStarted = false;
   try {
     if (typeof Worker === 'function') {
       generatorWorker = new Worker(new URL('./generator-worker.js', import.meta.url), { type: 'module' });
       generatorWorker.addEventListener('message', event => {
         const message = event.data || {};
         if (message.type === 'READY') { workerReady = message.symbol === workerSymbol; return; }
-        if (message.type === 'ERROR') { workerBusy = false; showGeneratorStatus(`WORKER ERROR · ${message.message}`); return; }
+        if (message.type === 'ERROR') { workerBusy = false; workerReady = false; generatorWorker?.terminate(); generatorWorker = null; showGeneratorStatus(`WORKER RECOVERED · ${message.message}`); return; }
         if (message.type !== 'TICK_RESULT' || !message.tick) return;
-        workerBusy = false;
+        workerBusy = false; workerBusySince = 0;
         const model = models.get(message.tick.symbol);
         if (model && message.snapshot) {
           if (model.version <= message.snapshot.version) model.restore(message.snapshot);
@@ -72,6 +73,10 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
       try { generated.set(symbol, await storage.loadTicks('generated', symbol, 1000)); } catch { generated.set(symbol, []); }
     }
     renderAll();
+    if (symbol === getSelected() && model.status === 'READY' && !autoStarted && settings.autoStartGenerator !== false) {
+      autoStarted = true;
+      startGenerator();
+    }
     return status.get(symbol);
   }
 
@@ -118,8 +123,22 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   function storeGenerated(tick) {
     const rows = generated.get(tick.symbol) || [];
     generated.set(tick.symbol, [...rows, tick].slice(-1000)); generatedTotal += 1;
-    storage.appendGenerated(tick).catch(error => showStorage(error.message));
-    renderGenerator(tick.symbol); renderStats(); renderExplorer(); renderDiagnostics();
+    generatedWriteQueue.push(tick);
+    if (!generatedWriteTimer) generatedWriteTimer = window.setTimeout(flushGenerated, 250);
+    const now = Date.now();
+    if (now - lastGeneratorRender >= 150) {
+      lastGeneratorRender = now; renderGenerator(tick.symbol); renderStats(); renderExplorer(); renderDiagnostics();
+    } else if (!generatorRenderTimer) {
+      generatorRenderTimer = window.setTimeout(() => { generatorRenderTimer = 0; lastGeneratorRender = Date.now(); renderGenerator(tick.symbol); renderStats(); renderExplorer(); renderDiagnostics(); }, 150 - (now - lastGeneratorRender));
+    }
+  }
+  async function flushGenerated() {
+    clearTimeout(generatedWriteTimer); generatedWriteTimer = 0;
+    const batch = generatedWriteQueue; generatedWriteQueue = [];
+    if (!batch.length) return;
+    try { await storage.appendGeneratedBatch(batch); }
+    catch (error) { showStorage(`Could not persist ${batch.length} simulated ticks: ${error.message}`); }
+    if (generatedWriteQueue.length && !generatedWriteTimer) generatedWriteTimer = window.setTimeout(flushGenerated, 250);
   }
   function initializeWorker(symbol) {
     const model = models.get(symbol); if (!generatorWorker || !model) return false;
@@ -130,22 +149,33 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   function startGenerator() {
     if (started && !paused) return;
     started = true; paused = false; clearInterval(timer);
-    const rate = Math.max(1, Math.min(50, Number($('generationRate')?.value) || 1));
+    const rate = Math.max(1, Math.min(100, Number($('generationRate')?.value) || 1));
     const symbol = $('generatorSymbol')?.value || getSelected();
+    if (!models.get(symbol) || models.get(symbol).status !== 'READY') showGeneratorStatus(`WAITING FOR MODEL · ${symbol} needs at least 10 actual ticks`);
     if ($('generatorMode')?.value !== 'offline' && getConnected() && symbol !== getSelected()) onSelectSymbol?.(symbol);
     if (generatorWorker && workerSymbol !== symbol) initializeWorker(symbol);
     timer = window.setInterval(() => {
       const currentSymbol = $('generatorSymbol')?.value || getSelected(), options = { method: $('modelSelect')?.value || 'markov', mode: $('generatorMode')?.value === 'offline' || !getConnected() ? 'offline' : 'live-learning' };
       try {
+        const activeModel = models.get(currentSymbol);
+        if (!activeModel || activeModel.status !== 'READY') { showGeneratorStatus(`WAITING FOR MODEL · ${currentSymbol} needs at least 10 actual ticks`); return; }
         if (generatorWorker) {
           if (currentSymbol !== workerSymbol) { initializeWorker(currentSymbol); return; }
           if (!workerReady) return;
-          if (workerBusy) { droppedGenerationRequests += 1; return; }
-          workerBusy = true; generatorWorker.postMessage({ type: 'TICK', options });
+          if (workerBusy) {
+            droppedGenerationRequests += 1;
+            if (Date.now() - workerBusySince > 5000) {
+              generatorWorker.terminate(); generatorWorker = null; workerBusy = false; workerReady = false;
+              showGeneratorStatus('WORKER STALLED · switched to main-thread generation');
+              makeGenerated(currentSymbol);
+            }
+            return;
+          }
+          workerBusy = true; workerBusySince = Date.now(); generatorWorker.postMessage({ type: 'TICK', options });
         } else makeGenerated(currentSymbol);
       } catch (error) { showGeneratorStatus(`WAITING · ${error.message}`); }
     }, 1000 / rate);
-    showGeneratorStatus(getConnected() ? 'LIVE-LEARNING' : 'OFFLINE SIMULATION');
+    showGeneratorStatus(getConnected() ? 'LIVE-LEARNING · MIMIC MODE' : 'OFFLINE SIMULATION · MIMIC MODE');
     logEvent({ type: 'generator_started', symbol: $('generatorSymbol')?.value || getSelected(), rate });
     renderAll();
   }
@@ -241,7 +271,15 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
     const rows = generated.get(symbol) || [], latest = rows.at(-1), model = models.get(symbol);
     $('generatedQuote').textContent = latest?.quote || '—'; $('generatedTime').textContent = latest ? `${new Date(latest.generatedAt).toLocaleTimeString()} · d${latest.digit} · ${latest.direction} · ${latest.mode} · model v${latest.modelVersion}` : `Model ${model?.status || 'PENDING'} · ${number(model?.actualCount || 0)} actual training ticks`;
     $('generatedHistory').innerHTML = rows.slice(-18).reverse().map(t => `<span class="generated-chip">${esc(t.quote)}<small>d${t.digit}</small></span>`).join('');
-    showGeneratorStatus(paused ? 'PAUSED' : started ? (getConnected() ? 'LIVE-LEARNING' : 'OFFLINE SIMULATION') : 'STOPPED');
+    const actual = trainingData.get(symbol) || getActualTicks(symbol) || [];
+    const actualFreq = Array(10).fill(0), generatedFreq = Array(10).fill(0);
+    actual.slice(-1000).forEach(t => { const d = Number.isInteger(t.digit) ? t.digit : finalDigit(t.quote); if (Number.isInteger(d) && d >= 0 && d <= 9) actualFreq[d] += 1; });
+    rows.slice(-1000).forEach(t => { if (Number.isInteger(t.digit) && t.digit >= 0 && t.digit <= 9) generatedFreq[t.digit] += 1; });
+    const fidelity = $('mimicMetrics');
+    if (fidelity) fidelity.innerHTML = metric('Actual sample', number(actualFreq.reduce((a, b) => a + b, 0))) + metric('Generated sample', number(generatedFreq.reduce((a, b) => a + b, 0))) + metric('Digit-distribution JS distance', fidelityValue(actualFreq, generatedFreq)) + metric('Generator mode', $('modelSelect')?.selectedOptions?.[0]?.textContent || 'Adaptive Markov');
+    if (!started) showGeneratorStatus(paused ? 'PAUSED' : 'STOPPED · press Start to resume');
+    else if (paused) showGeneratorStatus('PAUSED');
+    else if (latest) showGeneratorStatus(`${getConnected() ? 'LIVE-LEARNING' : 'OFFLINE SIMULATION'} · ${latest.method === 'stress' ? 'PATTERN STRESS' : 'MIMIC'} · ${number(droppedGenerationRequests)} queued intervals skipped`);
     $('generatedCount').textContent = number(generatedTotal);
   }
   function renderExplorer() {
@@ -269,8 +307,8 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   function showStorage(text) { if ($('storageStatus')) $('storageStatus').textContent = text; }
   function showGeneratorStatus(text) { if ($('generatorState')) $('generatorState').textContent = text; }
   function download(filename, data) { const blob = new Blob([data], { type: 'application/json' }), url = URL.createObjectURL(blob), anchor = document.createElement('a'); anchor.href = url; anchor.download = filename; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
-  async function exportData(source) { const data = await storage.exportData({ source }); download(`tick-intelligence-${source}-${new Date().toISOString().slice(0, 10)}.json`, data); }
-  async function importData(file) { const text = await file.text(); const result = await storage.importData(text); showStorage(`Imported ${number(result.actual)} actual, ${number(result.generated)} simulated ticks, ${number(result.models)} models, ${number(result.forecasts)} forecasts. Reloading to restore records.`); setTimeout(() => location.reload(), 800); }
+  async function exportData(source) { await flushGenerated(); const data = await storage.exportData({ source }); download(`tick-intelligence-${source}-${new Date().toISOString().slice(0, 10)}.json`, data); }
+  async function importData(file) { await flushGenerated(); const text = await file.text(); const result = await storage.importData(text); showStorage(`Imported ${number(result.actual)} actual, ${number(result.generated)} simulated ticks, ${number(result.models)} models, ${number(result.forecasts)} forecasts. Reloading to restore records.`); setTimeout(() => location.reload(), 800); }
 
   document.querySelectorAll('.workspace-tab').forEach(tab => tab.addEventListener('click', () => {
     document.querySelectorAll('.workspace-tab').forEach(item => item.classList.toggle('active', item === tab));
@@ -278,13 +316,13 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
     renderAll();
   }));
   $('startGenerator')?.addEventListener('click', startGenerator); $('pauseGenerator')?.addEventListener('click', () => paused ? resumeGenerator() : pauseGenerator()); $('stopGenerator')?.addEventListener('click', stopGenerator);
-  $('generatorSymbol')?.addEventListener('change', e => { renderGenerator(e.target.value); if (started && generatorWorker) initializeWorker(e.target.value); }); $('generationRate')?.addEventListener('change', () => { if (started && !paused) startGenerator(); });
+  $('generatorSymbol')?.addEventListener('change', e => { renderGenerator(e.target.value); if (started && generatorWorker) initializeWorker(e.target.value); }); $('generationRate')?.addEventListener('change', () => { if (started && !paused) { clearInterval(timer); timer = 0; started = false; startGenerator(); } });
   $('issueForecast')?.addEventListener('click', () => { try { issueForecast($('forecastSymbol').value || getSelected(), Number($('forecastHorizon').value), $('forecastModel').value === 'baseline' ? 'baseline' : 'markov'); } catch (error) { window.alert(error.message); } });
   for (const id of ['filterSymbol', 'filterSource', 'filterDigit', 'filterDirection', 'filterSearch', 'filterFrom', 'filterTo', 'filterPrediction']) $(id)?.addEventListener('input', renderExplorer);
   $('saveSettings')?.addEventListener('click', async () => {
     const windows = $('rollingWindows').value.split(',').map(x => Number(x.trim())).filter(x => Number.isInteger(x) && x >= 10 && x <= 10000);
     if (!windows.length) { window.alert('Enter one or more valid windows (10–10,000).'); return; }
-    settings.windows = [...new Set(windows)].sort((a, b) => a - b); settings.priorStrength = Math.max(0, Number($('modelPrior').value) || 0); settings.validationWindow = Math.max(10, Number($('validationWindow').value) || 100); saveSettings(settings);
+    settings.windows = [...new Set(windows)].sort((a, b) => a - b); settings.priorStrength = Math.max(0, Number($('modelPrior').value) || 0); saveSettings(settings);
     for (const symbol of getSymbols()) { const model = models.get(symbol.symbol); if (model) { model.priorStrength = settings.priorStrength; const data = trainingData.get(symbol.symbol) || getActualTicks(symbol.symbol); model.fit(data); profiles.set(symbol.symbol, analyzeTicks(data, settings.windows)); await storage.saveModel(symbol.symbol, model.snapshot()); } }
     renderAll();
   });
@@ -303,5 +341,9 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
 
   return { initialize, registerSymbol, observeActual, renderAll, issueForecast, startGenerator, pauseGenerator, stopGenerator, storage, getModel: symbol => models.get(symbol), getProfile: symbol => profiles.get(symbol), getGenerated: symbol => generated.get(symbol) || [], metrics: symbol => forecasts.metrics(symbol) };
 }
-function loadSettings() { try { const value = JSON.parse(localStorage.getItem('tick-intelligence.settings.v1') || '{}'); return { windows: Array.isArray(value.windows) ? value.windows : [50, 100, 250, 500, 1000], priorStrength: Number(value.priorStrength ?? 1), validationWindow: Number(value.validationWindow ?? 100) }; } catch { return { windows: [50, 100, 250, 500, 1000], priorStrength: 1, validationWindow: 100 }; } }
+function loadSettings() { try { const value = JSON.parse(localStorage.getItem('tick-intelligence.settings.v1') || '{}'); return { windows: Array.isArray(value.windows) ? value.windows : [50, 100, 250, 500, 1000], priorStrength: Number(value.priorStrength ?? 1), autoStartGenerator: value.autoStartGenerator !== false }; } catch { return { windows: [50, 100, 250, 500, 1000], priorStrength: 1, autoStartGenerator: true }; } }
 function saveSettings(settings) { localStorage.setItem('tick-intelligence.settings.v1', JSON.stringify(settings)); }
+function fidelityValue(actual, generated) {
+  const normalize = values => { const total = values.reduce((a, b) => a + b, 0); return values.map(v => total ? v / total : 0); };
+  const a = normalize(actual), b = normalize(generated); return generated.reduce((x, y) => x + y, 0) ? jensenShannonDistance(a, b)?.toFixed(3) ?? '—' : 'waiting for generated sample';
+}

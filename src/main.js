@@ -12,7 +12,8 @@ const fmtTime = epoch => Number.isFinite(epoch) ? new Date(epoch * 1000).toLocal
 const state = {
   ws: null, request: 0, pending: new Map(), symbols: [], statuses: {}, selected: '', cacheDb: null,
   data: {}, subscription: null, busy: false, connected: false, retry: 0, reconnectTimer: 0,
-  arrival: null, mounted: true, manualDisconnect: false, lastTicks: {}, duplicateCount: 0, gapCount: 0,
+  arrival: null, mounted: true, manualDisconnect: false, lastTicks: {}, lastStreamTickAt: {}, lastStreamMessageAt: 0,
+  lastSubscribeAt: {}, receivedTickCount: 0, duplicateCount: 0, gapCount: 0, pingTimer: 0, healthTimer: 0,
 };
 const research = createResearchWorkspace({
   getActualTicks: symbol => state.data[symbol] || [],
@@ -79,6 +80,7 @@ function request(payload, timeout = 20000) {
 function onMessage(event) {
   let message;
   try { message = JSON.parse(event.data); } catch { return; }
+  state.lastStreamMessageAt = Date.now();
   if (message.req_id && state.pending.has(message.req_id)) {
     const task = state.pending.get(message.req_id);
     clearTimeout(task.timer);
@@ -100,6 +102,13 @@ function connect() {
     state.manualDisconnect = false;
     state.retry = 0;
     setConnection('connected', 'CONNECTED');
+    clearInterval(state.pingTimer);
+    state.pingTimer = window.setInterval(() => {
+      if (state.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+      request({ ping: 1 }, 12000).catch(error => {
+        if (state.ws === ws) { setStatus(`Deriv keepalive failed: ${error.message}; reconnecting…`); ws.close(); }
+      });
+    }, 25000);
     setStatus('Connected. Discovering active markets…');
     try {
       const response = await request({ active_symbols: 'full' });
@@ -125,8 +134,10 @@ function connect() {
       $('symbolSelect').innerHTML = '<option value="">Choose market…</option>' + state.symbols.map(s => `<option value="${escapeHtml(s.symbol)}">${escapeHtml(s.display_name || s.symbol)} · ${escapeHtml(s.symbol)}</option>`).join('');
       if (!state.selected) state.selected = state.symbols.find(s => s.symbol === '1HZ100V')?.symbol || state.symbols.find(s => s.symbol === 'R_100')?.symbol || state.symbols[0].symbol;
       $('symbolSelect').value = state.selected;
+      renderSymbols(); renderStats();
+      chooseSymbol(state.selected);
       await Promise.all(state.symbols.map(symbol => research.registerSymbol(symbol.symbol, state.data[symbol.symbol] || [])));
-      renderSymbols(); renderStats(); chooseSymbol(state.selected);
+      renderSymbols(); renderStats();
       setStatus(`${state.symbols.length} active symbols discovered. Loading up to ${fmtCount(HISTORY_LIMIT)} historical ticks per symbol.`);
       hydrateHistory();
     } catch (error) { setStatus(error.message); setConnection('error', 'API ERROR'); }
@@ -139,7 +150,8 @@ function connect() {
     setStatus('Connection closed. Cached actual history remains available; live observations are paused.');
     state.subscription = null;
     state.pending.forEach(item => { clearTimeout(item.timer); item.reject(new Error('WebSocket disconnected')); });
-    state.pending.clear();
+      state.pending.clear();
+    clearInterval(state.pingTimer); state.pingTimer = 0;
     if (state.manualDisconnect) return;
     scheduleReconnect();
   });
@@ -222,6 +234,7 @@ function chooseSymbol(symbol) {
   if (state.ws?.readyState === WebSocket.OPEN) subscribe(symbol);
 }
 async function subscribe(symbol) {
+  state.lastSubscribeAt[symbol] = Date.now();
   try {
     const response = await request({ ticks: symbol, subscribe: 1 });
     if (symbol !== state.selected) {
@@ -229,7 +242,9 @@ async function subscribe(symbol) {
       if (old && state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ forget: old }));
       return;
     }
-    state.subscription = response.subscription?.id || state.subscription;
+    if (!response.subscription?.id) throw new Error('Deriv did not confirm a live tick subscription.');
+    state.subscription = response.subscription.id;
+    state.lastSubscribeAt[symbol] = Date.now();
     if (!response.tick) setStatus(`Subscribed to ${symbol}; waiting for the next live tick.`);
   } catch (error) {
     if (symbol === state.selected) setStatus(`Live tick subscription failed: ${error.message}`);
@@ -248,7 +263,8 @@ function addLiveTick(raw, subscriptionId) {
   const epoch = Number(raw.epoch);
   const records = state.data[symbol] || [];
   const previous = state.lastTicks[symbol] || records.at(-1);
-  if (raw.id && previous?.id === raw.id || previous?.epoch === epoch && previous?.quote === quote) { state.duplicateCount += 1; return; }
+  const duplicate = raw.id && previous?.id ? previous.id === raw.id : previous?.epoch === epoch && previous?.quote === quote;
+  if (duplicate) { state.duplicateCount += 1; return; }
   const arrival = Date.now();
   const delta = previous ? decimalDifference(quote, previous.quote) : null;
   const direction = delta === null || Number(delta) === 0 ? 'UNCHANGED' : Number(delta) > 0 ? 'UP' : 'DOWN';
@@ -262,6 +278,7 @@ function addLiveTick(raw, subscriptionId) {
   state.data[symbol] = [...records, tick].slice(-HISTORY_LIMIT);
   if (state.statuses[symbol]) state.statuses[symbol] = { loaded: state.data[symbol].length, status: state.statuses[symbol].status === 'ready' ? 'ready' : 'loading' };
   state.arrival = Date.now();
+  state.lastStreamTickAt[symbol] = state.arrival; state.receivedTickCount += 1;
   $('statArrival').textContent = new Date(state.arrival).toLocaleTimeString();
   persistCache(symbol);
   if (symbol === state.selected) renderSelected();
@@ -278,13 +295,16 @@ function decimalDifference(current, previous) {
 function renderSelected() {
   const records = state.data[state.selected] || [];
   const latest = records.at(-1);
+  const lastLiveAt = state.lastStreamTickAt[state.selected];
+  const liveAge = lastLiveAt ? Date.now() - lastLiveAt : Infinity;
+  const marketFresh = state.connected && liveAge < 30000;
   $('recordCount').textContent = `${fmtCount(records.length)} records`;
   $('latestQuote').textContent = latest?.quote || '—';
   $('latestDigit').textContent = Number.isInteger(latest?.digit) ? latest.digit : '—';
   $('quoteTime').textContent = latest ? `${fmtTime(latest.epoch)} · ${latest.epoch} epoch` : 'Waiting for tick data';
-  $('streamTitle').textContent = state.connected ? 'Live stream connected' : 'Live stream unavailable';
-  $('streamDetail').textContent = latest ? `Tick ${new Date(latest.epoch * 1000).toLocaleTimeString()} · received ${new Date(latest.arrival).toLocaleTimeString()}` : 'Historical observations and live updates remain distinct.';
-  $('streamPulse').classList.toggle('active', state.connected);
+  $('streamTitle').textContent = marketFresh ? 'Live ticks arriving' : state.connected ? 'Socket connected · tick stream stale' : 'Live stream unavailable';
+  $('streamDetail').textContent = latest ? `Market ${new Date(latest.epoch * 1000).toLocaleTimeString()} · received ${new Date(latest.arrival).toLocaleTimeString()} · ${lastLiveAt ? `last stream tick ${Math.round(liveAge / 1000)}s ago` : 'no live tick received this session'}` : 'Historical observations and live updates remain distinct.';
+  $('streamPulse').classList.toggle('active', marketFresh);
   const rows = records.slice(-30).reverse();
   $('tickRows').innerHTML = rows.length ? rows.map(t => `<tr><td class="quote-cell">${escapeHtml(t.quote)}</td><td><span class="digit-chip">${t.digit}</span></td><td>${escapeHtml(fmtTime(t.epoch))}</td><td>${escapeHtml(new Date(t.arrival).toLocaleTimeString())}</td><td><span class="actual-tag"><i></i> DERIV ACTUAL</span></td></tr>`).join('') : '<tr><td class="table-empty" colspan="5">No records loaded for the selected symbol.</td></tr>';
 }
@@ -300,6 +320,24 @@ $('disconnectBtn').addEventListener('click', () => {
   research.renderAll();
 });
 window.setInterval(() => { $('clock').textContent = `${new Date().toISOString().slice(11, 19)} UTC`; }, 1000);
+state.healthTimer = window.setInterval(() => {
+  if (!state.connected || !state.ws || state.ws.readyState !== WebSocket.OPEN || !state.selected) return;
+  const symbol = state.selected, profile = research.getProfile(symbol);
+  const median = Number(profile?.intervals?.medianMs) || 1000;
+  const staleAfter = Math.max(20000, Math.min(90000, median * 8));
+  const last = state.lastStreamTickAt[symbol] || state.lastSubscribeAt[symbol] || 0;
+  if (!state.lastStreamTickAt[symbol] || Date.now() - state.lastStreamTickAt[symbol] >= 30000) renderSelected();
+  if (last && Date.now() - last > staleAfter && Date.now() - (state.lastSubscribeAt[symbol] || 0) > staleAfter) {
+    setStatus(`No Deriv ticks for ${Math.round((Date.now() - last) / 1000)}s on ${symbol}; refreshing subscription…`);
+    if (state.subscription) { try { state.ws.send(JSON.stringify({ forget: state.subscription })); } catch { /* retry below */ } }
+    state.subscription = null;
+    subscribe(symbol);
+  }
+  if (Date.now() - state.lastStreamMessageAt > 65000) {
+    setStatus('No Deriv WebSocket messages for 65s; reconnecting to restore live data…');
+    state.ws.close();
+  }
+}, 5000);
 window.addEventListener('beforeunload', () => { state.mounted = false; clearTimeout(state.reconnectTimer); if (state.subscription && state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ forget: state.subscription })); state.ws?.close(); });
 setConnection('connecting', 'CONNECTING');
 restoreCache().finally(connect);

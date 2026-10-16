@@ -84,14 +84,29 @@ export class LocalTickModel {
     const output = [];
     for (let i = 0; i < steps; i += 1) {
       const method = options.method || 'markov';
-      const probs = this.probabilities(prevDigit, method === 'baseline' ? 'empirical' : method, prevPrev);
-      const predictedDigit = weighted(probs.map((p, value) => ({ value, weight: p })), rng);
-      const incrementChoices = this.incrementDistribution();
+      const probabilityMethod = method === 'baseline' || method === 'empirical' || method === 'stress' ? 'empirical' : 'markov';
+      const probs = this.probabilities(prevDigit, probabilityMethod, prevPrev);
+      let predictedDigit;
+      if (method === 'persistence' && Number.isInteger(prevDigit)) {
+        predictedDigit = prevDigit;
+      } else if (method === 'stress') {
+        const minimum = Math.min(...probs);
+        predictedDigit = weighted(probs.map((p, value) => ({ value, weight: Math.abs(p - minimum) < 1e-12 ? 1 : 0 })), rng);
+      } else {
+        predictedDigit = weighted(probs.map((p, value) => ({ value, weight: p })), rng);
+      }
+      const incrementChoices = method === 'persistence' ? [{ value: '0', weight: 1 }] : this.incrementDistribution();
       const matching = incrementChoices.filter(item => {
         const candidate = decimal(units(quote, this.priceScale) + BigInt(item.value), this.priceScale);
         return extractDigit(candidate) === predictedDigit;
       });
-      const deltaString = weighted(matching.length ? matching : incrementChoices, rng) || '1';
+      const stressIncrements = method === 'stress' ? [...incrementChoices].sort((a, b) => Math.abs(Number(b.value)) - Math.abs(Number(a.value))).slice(0, Math.max(1, Math.ceil(incrementChoices.length * 0.1))) : incrementChoices;
+      let eligible = matching.length ? matching : stressIncrements;
+      if (method === 'stress' && !matching.length) {
+        const forced = Array.from({ length: 19 }, (_, index) => String(index - 9)).filter(delta => extractDigit(decimal(units(quote, this.priceScale) + BigInt(delta), this.priceScale)) === predictedDigit);
+        if (forced.length) eligible = forced.map(value => ({ value, weight: 1 }));
+      }
+      const deltaString = weighted(eligible, rng) || '1';
       const priceUnits = units(quote, this.priceScale), nextUnits = priceUnits + BigInt(deltaString);
       const nextQuote = formatQuote(decimal(nextUnits, this.priceScale), this.priceScale);
       const nextDigit = extractDigit(nextQuote);

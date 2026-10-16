@@ -65,3 +65,41 @@ test('a forecast is unavailable when only generated history exists', () => {
   model.fit([{ ...actualTicks('X', 10)[0], source: 'LOCAL_GENERATED' }]);
   assert.throws(() => model.generate(), /at least 10 actual ticks/);
 });
+
+test('persistence generator repeats the last generated digit from the learned stream', () => {
+  const history = actualTicks('PERSIST', 60);
+  const model = new LocalTickModel('PERSIST');
+  model.fit(history);
+  const previousDigit = model.lastActualDigit;
+  const tick = model.generate({ method: 'persistence', mode: 'offline' });
+  assert.equal(tick.digit, previousDigit);
+  assert.equal(tick.method, 'persistence');
+});
+
+test('pattern stress mode deliberately samples a least-likely empirical digit', () => {
+  const history = actualTicks('STRESS', 80);
+  const model = new LocalTickModel('STRESS');
+  model.fit(history);
+  const probs = model.probabilities(null, 'empirical');
+  const leastLikely = Math.min(...probs);
+  const generated = model.generate({ method: 'stress', mode: 'offline' });
+  assert.equal(probs[generated.digit], leastLikely);
+  assert.equal(generated.source, 'LOCAL_GENERATED');
+  assert.equal(generated.method, 'stress');
+});
+
+test('forecast scores distinct post-issue ticks in the same second and stops at its horizon', () => {
+  const history = actualTicks('SAMESECOND', 30);
+  history.at(-1).sequence = 500;
+  const model = new LocalTickModel('SAMESECOND'); model.fit(history);
+  const book = new ForecastBook();
+  const forecast = book.issue({ symbol: 'SAMESECOND', model, actualTicks: history, horizon: 2 });
+  const first = { ...history.at(-1), sequence: 501, id: 'same-second:1', arrival: forecast.createdAt + 1 };
+  const second = { ...history.at(-1), sequence: 502, id: 'same-second:2', arrival: forecast.createdAt + 2 };
+  const third = { ...history.at(-1), sequence: 503, id: 'same-second:3', arrival: forecast.createdAt + 3 };
+  assert.equal(book.scoreActual(first).length, 1);
+  assert.equal(book.scoreActual(second).length, 1);
+  assert.equal(book.scoreActual(third).length, 0);
+  assert.equal(book.list()[0].scoringCount, 2);
+  assert.equal(book.list()[0].evaluations.length, 2);
+});
