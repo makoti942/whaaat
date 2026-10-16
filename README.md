@@ -2,6 +2,10 @@
 
 A browser-based research workspace for observing Deriv market data, exploring symbol-specific tick behavior, generating an independent local simulated series, and evaluating locked forecasts only against actual observations received afterward. This is a research and educational tool—not a trading system, signal service, or claim of predictive profitability.
 
+## Live website
+
+The permanent deployment is available at [whaaat-eight.vercel.app](https://whaaat-eight.vercel.app/). The repository's configured Vercel deployment publishes updates from `main`; GitHub Actions runs the test suite and production build as a separate CI check.
+
 ## Run locally
 
 Requirements: Node.js 20+ and npm.

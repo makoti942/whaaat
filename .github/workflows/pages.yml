@@ -1,24 +1,16 @@
-name: Deploy to GitHub Pages
+name: Build validation
 
 on:
   push:
     branches: [main]
-  workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: pages
-  cancel-in-progress: true
 
 jobs:
-  build:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  test-and-build:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -34,16 +26,3 @@ jobs:
         run: npm test
       - name: Build site
         run: npm run build
-        env:
-          GITHUB_PAGES: 'true'
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-        with:
-          enablement: true
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: dist
-      - name: Deploy Pages site
-        id: deployment
-        uses: actions/deploy-pages@v4
