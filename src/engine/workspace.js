@@ -13,7 +13,7 @@ const finalDigit = quote => { const m = String(quote).match(/\d/g); return m ? N
 export function createResearchWorkspace({ getActualTicks, getSymbols, getConnected, getSelected, onSelectSymbol }) {
   const storage = new ResearchStorage();
   const settings = loadSettings();
-  const models = new Map(), profiles = new Map(), generated = new Map(), status = new Map(), trainingData = new Map(), liveMimic = new Map();
+  const models = new Map(), profiles = new Map(), generated = new Map(), status = new Map(), trainingData = new Map(), liveMimic = new Map(), lockedPredictions = new Map();
   let forecasts = new ForecastBook(), timer = 0, started = false, paused = false, generatedTotal = 0;
   let recentEventRows = [], lastRender = 0, renderTimer = 0, droppedGenerationRequests = 0;
   let generatedWriteQueue = [], generatedWriteTimer = 0, generatorRenderTimer = 0, lastGeneratorRender = 0;
@@ -87,6 +87,7 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
     const model = models.get(tick.symbol) || new LocalTickModel(tick.symbol, { priorStrength: settings.priorStrength, windowSize: Math.max(...settings.windows) });
     models.set(tick.symbol, model);
     scoreLiveMimic(tick);
+    scoreLockedPrediction(tick);
     const history = trainingData.get(tick.symbol) || [];
     if (!history.some(row => row.id && row.id === tick.id)) history.push(tick);
     const retained = history.slice(-10000); trainingData.set(tick.symbol, retained);
@@ -106,6 +107,11 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
 
   function predictionHorizon() {
     return Math.max(2, Math.min(36, Number($('predictionHorizon')?.value) || 12));
+  }
+  function predictionWindow() {
+    const from = Math.max(1, Math.min(36, Number($('predictionFrom')?.value) || 2));
+    const to = Math.max(from, Math.min(36, Number($('predictionTo')?.value) || 7));
+    return { from, to };
   }
   function prepareLiveMimic(symbol, model, actual) {
     if (!model || model.status !== 'READY' || !actual?.length) return;
@@ -128,6 +134,30 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
     live.lastPrediction = prediction; live.lastOutcome = { tick, actualDigit, correct, quoteError };
     live.history = [{ tick, prediction, actualDigit, correct, quoteError }].concat(live.history || []).slice(0, 36);
     live.path = live.path.slice(1);
+  }
+
+  function lockPrediction(symbol, method = 'markov') {
+    const model = models.get(symbol), actual = trainingData.get(symbol) || getActualTicks(symbol) || [];
+    if (!model || model.status !== 'READY' || actual.length < 10) throw new Error(`${symbol} needs at least 10 actual ticks before locking a prediction.`);
+    const { from, to } = predictionWindow();
+    const last = actual.at(-1), path = model.predictPath(to, { method, seed: (Date.now() ^ model.version) >>> 0 || 1, startQuote: String(last.quote), startDigit: Number.isInteger(last.digit) ? last.digit : finalDigit(last.quote) });
+    const scores = Array(10).fill(0);
+    path.slice(from - 1, to).forEach(step => step.distribution?.forEach((probability, digit) => { scores[digit] += probability || 0; }));
+    const digits = scores.map((score, digit) => ({ score, digit })).sort((a, b) => b.score - a.score || a.digit - b.digit).slice(0, 2).sort((a, b) => a.digit - b.digit).map(item => item.digit);
+    lockedPredictions.set(symbol, { symbol, method, from, to, digits, path, issueTickId: last.id, issuedAt: Date.now(), ticksSeen: 0, status: 'WAITING', hit: null, actual: null });
+    renderPrediction(symbol);
+    return lockedPredictions.get(symbol);
+  }
+  function scoreLockedPrediction(tick) {
+    const lock = lockedPredictions.get(tick.symbol);
+    if (!lock || lock.status === 'HIT' || lock.status === 'MISSED' || tick.id === lock.issueTickId) return;
+    lock.ticksSeen += 1;
+    const digit = Number.isInteger(tick.digit) ? tick.digit : finalDigit(tick.quote);
+    if (lock.ticksSeen >= lock.from && lock.ticksSeen <= lock.to && lock.digits.includes(digit)) {
+      lock.status = 'HIT'; lock.hit = true; lock.actual = { tick, digit, step: lock.ticksSeen };
+    } else if (lock.ticksSeen >= lock.to) {
+      lock.status = 'MISSED'; lock.hit = false; lock.actual = { tick, digit, step: lock.ticksSeen };
+    }
   }
 
   function issueForecast(symbol, horizon, method) {
@@ -249,11 +279,11 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
     if ($('explorerCount')) $('explorerCount').textContent = `${number(actual.length + gen.length)} visible records`;
     if ($('symbolManagerCount')) $('symbolManagerCount').textContent = `${getSymbols().length} per-symbol profiles`;
     const symbols = getSymbols(), readyModels = symbols.filter(s => models.get(s.symbol)?.status === 'READY').length;
-    const selectedLearning = Math.min(100, Math.round((model?.actualCount || actual.length) / 10 * 100));
+    const selectedLearning = Math.min(100, Math.round((model?.actualCount || actual.length) / 1000 * 100));
     const coverage = symbols.length ? Math.round(readyModels / symbols.length * 100) : selectedLearning;
     if ($('learningProgressFill')) $('learningProgressFill').style.width = `${selectedLearning}%`;
     if ($('learningProgressPercent')) $('learningProgressPercent').textContent = `${selectedLearning}%`;
-    if ($('learningProgressText')) $('learningProgressText').textContent = symbols.length ? `${readyModels} of ${symbols.length} symbol models ready · selected market ${selectedLearning}%` : 'Waiting for actual ticks';
+    if ($('learningProgressText')) $('learningProgressText').textContent = symbols.length ? `${readyModels} of ${symbols.length} models ready · ${number(model?.actualCount || actual.length)} actual ticks collected` : 'Waiting for actual ticks';
     if ($('learningCoveragePercent')) $('learningCoveragePercent').textContent = `${coverage}%`;
     renderOverview(actual, gen, model, score);
   }
@@ -336,17 +366,18 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
     $('generatedCount').textContent = number(generatedTotal);
   }
   function renderPrediction(symbol) {
-    const live = liveMimic.get(symbol), actual = trainingData.get(symbol)?.at(-1) || getActualTicks(symbol)?.at(-1), model = models.get(symbol);
+    const live = liveMimic.get(symbol), lock = lockedPredictions.get(symbol), actual = trainingData.get(symbol)?.at(-1) || getActualTicks(symbol)?.at(-1), model = models.get(symbol);
     if (!$('predictionActual')) return;
     $('predictionActual').textContent = actual?.digit ?? finalDigit(actual?.quote) ?? '—';
     $('predictionActualQuote').textContent = actual?.quote || 'Waiting for live tick';
-    $('predictionNextDigit').textContent = live?.path?.[0]?.digit ?? '—';
+    $('predictionNextDigit').textContent = lock?.digits?.length ? lock.digits.join(' · ') : '—';
     $('predictionModelState').textContent = model ? `${model.status} · ${number(model.actualCount)} actual ticks · model v${model.version}` : 'Waiting for training data';
     const evaluated = live?.evaluated || 0, accuracy = evaluated ? live.correct / evaluated : null;
     $('predictionAccuracy').textContent = Number.isFinite(accuracy) ? `${(accuracy * 100).toFixed(1)}%` : '—';
     $('predictionSamples').textContent = `${number(evaluated)} scored next-tick predictions`;
-    $('predictionOutcome').textContent = live?.lastOutcome ? `${live.lastOutcome.correct ? 'Correct digit' : 'Missed digit'} · actual ${live.lastOutcome.actualDigit} · predicted ${live.lastPrediction?.digit}` : 'Waiting for the next actual tick to score the first prediction';
-    $('predictionPath').innerHTML = (live?.path || []).map((item, index) => `<span class="prediction-digit-chip ${index === 0 ? 'next' : ''}"><b>${item.digit}</b><small>+${index + 1}</small></span>`).join('') || '<span class="empty-copy">Need at least 10 actual ticks.</span>';
+    $('predictionOutcome').textContent = lock ? `${lock.status} · digits ${lock.digits.join(' and ')} · ticks +${lock.from} to +${lock.to}` : 'No locked prediction yet';
+    $('predictionPath').innerHTML = lock ? lock.digits.map(digit => `<span class="prediction-digit-chip next"><b>${digit}</b><small>candidate</small></span>`).join('') : '<span class="empty-copy">Lock a prediction after at least 10 actual ticks.</span>';
+    if ($('predictionWindow')) $('predictionWindow').textContent = lock ? `Locked at ${new Date(lock.issuedAt).toLocaleTimeString()} · unchanged until the +${lock.to} tick window completes` : 'No prediction window locked';
   }
   function renderExplorer() {
     if (!$('explorerRows')) return;
@@ -384,9 +415,9 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   $('startGenerator')?.addEventListener('click', startGenerator); $('pauseGenerator')?.addEventListener('click', () => paused ? resumeGenerator() : pauseGenerator()); $('stopGenerator')?.addEventListener('click', stopGenerator);
   $('generatorSymbol')?.addEventListener('change', e => { renderGenerator(e.target.value); if (started && generatorWorker) initializeWorker(e.target.value); }); $('generationRate')?.addEventListener('change', () => { if (started && !paused) { clearInterval(timer); timer = 0; started = false; startGenerator(); } });
   $('issueForecast')?.addEventListener('click', () => { try { issueForecast($('forecastSymbol').value || getSelected(), Number($('forecastHorizon').value), $('forecastModel').value === 'baseline' ? 'baseline' : 'markov'); } catch (error) { window.alert(error.message); } });
-  $('predictNext')?.addEventListener('click', () => { try { predictNext($('predictionSymbol').value || getSelected(), $('predictionModel').value || 'markov'); } catch (error) { window.alert(error.message); } });
+  $('predictNext')?.addEventListener('click', () => { try { lockPrediction($('predictionSymbol').value || getSelected(), $('predictionModel').value || 'markov'); } catch (error) { window.alert(error.message); } });
   $('predictionModel')?.addEventListener('change', () => { const symbol = $('predictionSymbol')?.value || getSelected(); const model = models.get(symbol); const actual = trainingData.get(symbol) || getActualTicks(symbol) || []; if (model) prepareLiveMimic(symbol, model, actual); renderPrediction(symbol); });
-  $('predictionHorizon')?.addEventListener('change', () => { const symbol = $('predictionSymbol')?.value || getSelected(); const model = models.get(symbol); const actual = trainingData.get(symbol) || getActualTicks(symbol) || []; if (model) prepareLiveMimic(symbol, model, actual); renderPrediction(symbol); });
+  for (const id of ['predictionFrom', 'predictionTo']) $(id)?.addEventListener('change', () => renderPrediction($('predictionSymbol')?.value || getSelected()));
   $('predictionSymbol')?.addEventListener('change', event => renderPrediction(event.target.value));
   for (const id of ['filterSymbol', 'filterSource', 'filterDigit', 'filterDirection', 'filterSearch', 'filterFrom', 'filterTo', 'filterPrediction']) $(id)?.addEventListener('input', renderExplorer);
   $('saveSettings')?.addEventListener('click', async () => {
