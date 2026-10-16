@@ -182,6 +182,20 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   function pauseGenerator() { if (!started || paused) return; clearInterval(timer); timer = 0; paused = true; showGeneratorStatus('PAUSED'); renderAll(); }
   function stopGenerator() { clearInterval(timer); timer = 0; started = false; paused = false; showGeneratorStatus('STOPPED'); renderAll(); }
   function resumeGenerator() { if (started && paused) startGenerator(); else startGenerator(); }
+  function predictNext(symbol, method = 'markov') {
+    const model = models.get(symbol), actual = trainingData.get(symbol) || getActualTicks(symbol) || [];
+    if (!model || model.status !== 'READY' || actual.length < 10) throw new Error(`${symbol} needs at least 10 actual ticks before prediction.`);
+    const last = actual.at(-1), prediction = model.predictPath(1, {
+      method, seed: (Date.now() ^ model.version) >>> 0 || 1,
+      startQuote: String(last.quote), startDigit: Number.isInteger(last.digit) ? last.digit : finalDigit(last.quote),
+    })[0];
+    const output = { symbol, createdAt: Date.now(), observedQuote: last.quote, observedDigit: last.digit ?? finalDigit(last.quote), ...prediction };
+    const result = $('predictionResult');
+    if (result) result.innerHTML = `<strong>${esc(output.quote)}</strong><span>digit ${output.digit} · ${esc(output.direction)} · ${esc(method)}</span><small>Based on ${number(model.actualCount)} actual ticks · model v${model.version}</small>`;
+    const status = $('predictionStatus');
+    if (status) status.textContent = `Prediction generated for ${symbol}. It is not counted as an actual tick until a later Deriv tick is observed.`;
+    return output;
+  }
 
   function renderAll(force = false) {
     const now = performance.now();
@@ -191,7 +205,7 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   }
   function populateSymbolSelects() {
     const symbols = getSymbols();
-    for (const id of ['generatorSymbol', 'forecastSymbol', 'filterSymbol']) {
+    for (const id of ['generatorSymbol', 'forecastSymbol', 'predictionSymbol', 'filterSymbol']) {
       const select = $(id); if (!select) continue;
       const value = select.value || getSelected();
       const first = id === 'filterSymbol' ? '<option value="">Selected market</option>' : '';
@@ -318,6 +332,7 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   $('startGenerator')?.addEventListener('click', startGenerator); $('pauseGenerator')?.addEventListener('click', () => paused ? resumeGenerator() : pauseGenerator()); $('stopGenerator')?.addEventListener('click', stopGenerator);
   $('generatorSymbol')?.addEventListener('change', e => { renderGenerator(e.target.value); if (started && generatorWorker) initializeWorker(e.target.value); }); $('generationRate')?.addEventListener('change', () => { if (started && !paused) { clearInterval(timer); timer = 0; started = false; startGenerator(); } });
   $('issueForecast')?.addEventListener('click', () => { try { issueForecast($('forecastSymbol').value || getSelected(), Number($('forecastHorizon').value), $('forecastModel').value === 'baseline' ? 'baseline' : 'markov'); } catch (error) { window.alert(error.message); } });
+  $('predictNext')?.addEventListener('click', () => { try { predictNext($('predictionSymbol').value || getSelected(), $('predictionModel').value || 'markov'); } catch (error) { window.alert(error.message); } });
   for (const id of ['filterSymbol', 'filterSource', 'filterDigit', 'filterDirection', 'filterSearch', 'filterFrom', 'filterTo', 'filterPrediction']) $(id)?.addEventListener('input', renderExplorer);
   $('saveSettings')?.addEventListener('click', async () => {
     const windows = $('rollingWindows').value.split(',').map(x => Number(x.trim())).filter(x => Number.isInteger(x) && x >= 10 && x <= 10000);
@@ -339,7 +354,7 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   if ($('rollingWindows')) $('rollingWindows').value = settings.windows.join(','); if ($('modelPrior')) $('modelPrior').value = settings.priorStrength;
   initialize();
 
-  return { initialize, registerSymbol, observeActual, renderAll, issueForecast, startGenerator, pauseGenerator, stopGenerator, storage, getModel: symbol => models.get(symbol), getProfile: symbol => profiles.get(symbol), getGenerated: symbol => generated.get(symbol) || [], metrics: symbol => forecasts.metrics(symbol) };
+  return { initialize, registerSymbol, observeActual, renderAll, issueForecast, predictNext, startGenerator, pauseGenerator, stopGenerator, storage, getModel: symbol => models.get(symbol), getProfile: symbol => profiles.get(symbol), getGenerated: symbol => generated.get(symbol) || [], metrics: symbol => forecasts.metrics(symbol) };
 }
 function loadSettings() { try { const value = JSON.parse(localStorage.getItem('tick-intelligence.settings.v1') || '{}'); return { windows: Array.isArray(value.windows) ? value.windows : [50, 100, 250, 500, 1000], priorStrength: Number(value.priorStrength ?? 1), autoStartGenerator: value.autoStartGenerator !== false }; } catch { return { windows: [50, 100, 250, 500, 1000], priorStrength: 1, autoStartGenerator: true }; } }
 function saveSettings(settings) { localStorage.setItem('tick-intelligence.settings.v1', JSON.stringify(settings)); }

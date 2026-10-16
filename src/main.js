@@ -1,4 +1,4 @@
-import { extractDigit, formatQuote, mapHistory, precisionFromPipSize } from './tick-data.js';
+import { extractDigit, formatQuote, mapHistory, precisionFromPipSize, tickIdentity } from './tick-data.js';
 import { createResearchWorkspace } from './engine/workspace.js';
 
 // Current official public read-only market-data socket; no account login or app ID is needed.
@@ -227,6 +227,11 @@ function chooseSymbol(symbol) {
   state.subscription = null;
   state.selected = symbol;
   $('symbolSelect').value = symbol;
+  const generatorSelect = $('generatorSymbol');
+  if (generatorSelect && generatorSelect.value !== symbol) {
+    generatorSelect.value = symbol;
+    generatorSelect.dispatchEvent(new Event('change'));
+  }
   $('selectedName').textContent = state.symbols.find(s => s.symbol === symbol)?.display_name || symbol;
   $('recordsTitle').textContent = `${state.symbols.find(s => s.symbol === symbol)?.display_name || symbol} · recent quotes`;
   renderSymbols(); renderSelected();
@@ -263,7 +268,10 @@ function addLiveTick(raw, subscriptionId) {
   const epoch = Number(raw.epoch);
   const records = state.data[symbol] || [];
   const previous = state.lastTicks[symbol] || records.at(-1);
-  const duplicate = raw.id && previous?.id ? previous.id === raw.id : previous?.epoch === epoch && previous?.quote === quote;
+  // Deriv can return the subscription id in tick.id. It is not a unique
+  // observation id, so never use it alone to deduplicate a live stream.
+  const identity = tickIdentity(symbol, epoch, quote);
+  const duplicate = previous?.identity === identity || (previous?.epoch === epoch && previous?.quote === quote);
   if (duplicate) { state.duplicateCount += 1; return; }
   const arrival = Date.now();
   const delta = previous ? decimalDifference(quote, previous.quote) : null;
@@ -271,7 +279,7 @@ function addLiveTick(raw, subscriptionId) {
   const intervalMs = previous ? Math.max(0, (epoch - previous.epoch) * 1000) : null;
   const medianInterval = research.getProfile(symbol)?.intervals?.medianMs;
   if (intervalMs && intervalMs > Math.max(5000, (medianInterval || 0) * 3)) state.gapCount += 1;
-  const tick = { symbol, source: 'DERIV_ACTUAL', quote, epoch, arrival, digit: extractDigit(quote), id: raw.id || `${symbol}:${epoch}:${records.length}`,
+  const tick = { symbol, source: 'DERIV_ACTUAL', quote, epoch, arrival, digit: extractDigit(quote), id: identity, identity, derivId: raw.id || null,
     numericPrice: Number(quote), previousQuote: previous?.quote ?? null, priceDifference: delta, direction, intervalMs,
     sequence: (state.tickSequence?.[symbol] || records.length) + 1, modelVersion: research.getModel(symbol)?.version ?? null };
   state.tickSequence ||= {}; state.tickSequence[symbol] = tick.sequence; state.lastTicks[symbol] = tick;

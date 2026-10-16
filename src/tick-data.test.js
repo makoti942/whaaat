@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractDigit, formatQuote, mapHistory, precisionFromPipSize } from './tick-data.js';
+import { extractDigit, formatQuote, mapHistory, precisionFromPipSize, tickIdentity } from './tick-data.js';
 
 test('keeps string quotes exactly, including trailing zeroes', () => {
   assert.equal(formatQuote('123.450', 3), '123.450');
@@ -21,6 +21,10 @@ test('extracts the final displayed decimal digit, not the integer units digit', 
   assert.equal(extractDigit('123.450'), 0);
   assert.equal(extractDigit('999.127'), 7);
   assert.equal(extractDigit('42'), 2);
+});
+test('uses epoch and quote for observation identity, not a reusable subscription id', () => {
+  assert.equal(tickIdentity('1HZ100V', 100, '12.30'), '1HZ100V:100:12.30');
+  assert.notEqual(tickIdentity('1HZ100V', 100, '12.30'), tickIdentity('1HZ100V', 101, '12.30'));
 });
 test('maps source history without mixing symbols or changing epochs', () => {
   const result = mapHistory('SYNTH_X', [12.34, 12.35], [100, 101], 3);

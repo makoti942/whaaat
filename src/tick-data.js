@@ -27,6 +27,10 @@ export function extractDigit(quote) {
   return digits?.length ? Number(digits[digits.length - 1]) : null;
 }
 
+export function tickIdentity(symbol, epoch, quote) {
+  return `${symbol}:${Number(epoch)}:${String(quote)}`;
+}
+
 export function mapHistory(symbol, prices, times, precision) {
   const output = [];
   const length = Math.min(prices.length, times.length);
@@ -41,7 +45,7 @@ export function mapHistory(symbol, prices, times, precision) {
       epoch,
       arrival: Date.now(),
       digit: extractDigit(quote),
-      id: `${symbol}:${epoch}:${i}`,
+      id: tickIdentity(symbol, epoch, quote),
     });
   }
   return output;
