@@ -248,6 +248,13 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
     if ($('generatedCount')) $('generatedCount').textContent = number(generatedTotal);
     if ($('explorerCount')) $('explorerCount').textContent = `${number(actual.length + gen.length)} visible records`;
     if ($('symbolManagerCount')) $('symbolManagerCount').textContent = `${getSymbols().length} per-symbol profiles`;
+    const symbols = getSymbols(), readyModels = symbols.filter(s => models.get(s.symbol)?.status === 'READY').length;
+    const selectedLearning = Math.min(100, Math.round((model?.actualCount || actual.length) / 10 * 100));
+    const coverage = symbols.length ? Math.round(readyModels / symbols.length * 100) : selectedLearning;
+    if ($('learningProgressFill')) $('learningProgressFill').style.width = `${selectedLearning}%`;
+    if ($('learningProgressPercent')) $('learningProgressPercent').textContent = `${selectedLearning}%`;
+    if ($('learningProgressText')) $('learningProgressText').textContent = symbols.length ? `${readyModels} of ${symbols.length} symbol models ready · selected market ${selectedLearning}%` : 'Waiting for actual ticks';
+    if ($('learningCoveragePercent')) $('learningCoveragePercent').textContent = `${coverage}%`;
     renderOverview(actual, gen, model, score);
   }
   function renderOverview(actual, gen, model, score) {
@@ -294,6 +301,11 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   function metric(label, value) { return `<div class="metric-box"><span>${esc(label)}</span><b>${typeof value === 'number' ? (Number.isFinite(value) ? value.toFixed(6) : '—') : esc(value ?? '—')}</b></div>`; }
   function renderLearning() {
     const symbols = getSymbols();
+    if (!$('modelReadiness') || !$('accuracyMetrics') || !$('modelEvents')) return;
+    const selectedModel = models.get(getSelected()), selectedActual = trainingData.get(getSelected()) || getActualTicks(getSelected()) || [];
+    const ready = symbols.filter(s => models.get(s.symbol)?.status === 'READY').length;
+    const live = liveMimic.get(getSelected()), liveAccuracy = live?.evaluated ? live.correct / live.evaluated : null;
+    if ($('learningSummaryMetrics')) $('learningSummaryMetrics').innerHTML = metric('Selected actual ticks', number(selectedModel?.actualCount || selectedActual.length)) + metric('Selected model', selectedModel?.status || 'WAITING') + metric('Ready symbols', `${ready} / ${symbols.length || 0}`) + metric('Live digit accuracy', Number.isFinite(liveAccuracy) ? `${(liveAccuracy * 100).toFixed(1)}%` : 'Not scored yet');
     $('modelReadiness').innerHTML = symbols.map(s => { const m = models.get(s.symbol), st = status.get(s.symbol) || {}, accuracy = forecasts.metrics(s.symbol); return `<div class="readiness-row"><span>${esc(s.symbol)} <small>${number(m?.actualCount || 0)} training ticks · v${m?.version || 0}</small></span><span>${m?.status || 'PENDING'}<small> · ${accuracy.evaluatedPredictions} evaluated</small></span></div>`; }).join('') || '<p class="empty-copy">Waiting for symbol discovery and actual observations.</p>';
     const metrics = forecasts.metrics(getSelected());
     $('accuracyMetrics').innerHTML = accuracyBox('Next-digit accuracy', metrics.digit, 'Observed outcomes only') + accuracyBox('Empirical baseline', metrics.baselineDigit, 'Frozen at issue time') + accuracyBox('Exact quote match', metrics.exactPrice, 'Exact displayed precision') + accuracyBox('Direction accuracy', metrics.direction, 'When actual movement known') + scoreBox('Mean Brier score', metrics.brierScore, metrics.brierSamples, 'Multiclass · lower is better') + scoreBox('Validation status', metrics.validationStatus, metrics.evaluatedPredictions, 'Only issued forecasts scored prospectively');
