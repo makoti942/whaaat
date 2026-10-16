@@ -13,7 +13,7 @@ const finalDigit = quote => { const m = String(quote).match(/\d/g); return m ? N
 export function createResearchWorkspace({ getActualTicks, getSymbols, getConnected, getSelected, onSelectSymbol }) {
   const storage = new ResearchStorage();
   const settings = loadSettings();
-  const models = new Map(), profiles = new Map(), generated = new Map(), status = new Map(), trainingData = new Map();
+  const models = new Map(), profiles = new Map(), generated = new Map(), status = new Map(), trainingData = new Map(), liveMimic = new Map();
   let forecasts = new ForecastBook(), timer = 0, started = false, paused = false, generatedTotal = 0;
   let recentEventRows = [], lastRender = 0, renderTimer = 0, droppedGenerationRequests = 0;
   let generatedWriteQueue = [], generatedWriteTimer = 0, generatorRenderTimer = 0, lastGeneratorRender = 0;
@@ -63,6 +63,7 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
     const ready = actual.length > 0;
     if (ready) {
       model.fit(actual);
+      prepareLiveMimic(symbol, model, actual);
       profiles.set(symbol, analyzeTicks(actual, settings.windows));
       status.set(symbol, { dataReady: true, modelReady: model.status === 'READY', sampleCount: actual.length, updatedAt: Date.now() });
       try { await storage.appendActualBatch(actual.slice(-1000)); await storage.saveModel(symbol, model.snapshot()); } catch (error) { showStorage(error.message); }
@@ -85,10 +86,12 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
     const results = forecasts.scoreActual(tick);
     const model = models.get(tick.symbol) || new LocalTickModel(tick.symbol, { priorStrength: settings.priorStrength, windowSize: Math.max(...settings.windows) });
     models.set(tick.symbol, model);
+    scoreLiveMimic(tick);
     const history = trainingData.get(tick.symbol) || [];
     if (!history.some(row => row.id && row.id === tick.id)) history.push(tick);
     const retained = history.slice(-10000); trainingData.set(tick.symbol, retained);
     model.fit(retained);
+    prepareLiveMimic(tick.symbol, model, retained);
     profiles.set(tick.symbol, analyzeTicks(retained, settings.windows));
     status.set(tick.symbol, { dataReady: true, modelReady: model.status === 'READY', sampleCount: model.actualCount, updatedAt: Date.now() });
     if (generatorWorker && workerSymbol === tick.symbol) { workerReady = false; generatorWorker.postMessage({ type: 'UPDATE', snapshot: model.snapshot() }); }
@@ -99,6 +102,32 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
       for (const forecast of forecasts.forecasts.filter(f => f.symbol === tick.symbol)) await storage.saveForecast(forecast);
     } catch (error) { showStorage(error.message); }
     renderAll();
+  }
+
+  function predictionHorizon() {
+    return Math.max(2, Math.min(36, Number($('predictionHorizon')?.value) || 12));
+  }
+  function prepareLiveMimic(symbol, model, actual) {
+    if (!model || model.status !== 'READY' || !actual?.length) return;
+    const last = actual.at(-1);
+    const prior = liveMimic.get(symbol) || { evaluated: 0, correct: 0, quoteError: 0, history: [] };
+    prior.path = model.predictPath(predictionHorizon(), {
+      method: $('predictionModel')?.value || 'markov', seed: (Date.now() ^ model.version) >>> 0 || 1,
+      startQuote: String(last.quote), startDigit: Number.isInteger(last.digit) ? last.digit : finalDigit(last.quote),
+    });
+    prior.issuedAt = Date.now(); prior.modelVersion = model.version; prior.lastActual = last; prior.symbol = symbol;
+    liveMimic.set(symbol, prior);
+  }
+  function scoreLiveMimic(tick) {
+    const live = liveMimic.get(tick.symbol), prediction = live?.path?.[0];
+    if (!live || !prediction || tick.id === live.lastActual?.id) return;
+    const actualDigit = Number.isInteger(tick.digit) ? tick.digit : finalDigit(tick.quote);
+    const correct = actualDigit === prediction.digit;
+    const quoteError = Number.isFinite(Number(tick.quote)) && Number.isFinite(Number(prediction.quote)) ? Math.abs(Number(tick.quote) - Number(prediction.quote)) : null;
+    live.evaluated += 1; if (correct) live.correct += 1; if (quoteError !== null) live.quoteError += quoteError;
+    live.lastPrediction = prediction; live.lastOutcome = { tick, actualDigit, correct, quoteError };
+    live.history = [{ tick, prediction, actualDigit, correct, quoteError }].concat(live.history || []).slice(0, 36);
+    live.path = live.path.slice(1);
   }
 
   function issueForecast(symbol, horizon, method) {
@@ -185,15 +214,13 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   function predictNext(symbol, method = 'markov') {
     const model = models.get(symbol), actual = trainingData.get(symbol) || getActualTicks(symbol) || [];
     if (!model || model.status !== 'READY' || actual.length < 10) throw new Error(`${symbol} needs at least 10 actual ticks before prediction.`);
+    prepareLiveMimic(symbol, model, actual);
     const last = actual.at(-1), prediction = model.predictPath(1, {
       method, seed: (Date.now() ^ model.version) >>> 0 || 1,
       startQuote: String(last.quote), startDigit: Number.isInteger(last.digit) ? last.digit : finalDigit(last.quote),
     })[0];
     const output = { symbol, createdAt: Date.now(), observedQuote: last.quote, observedDigit: last.digit ?? finalDigit(last.quote), ...prediction };
-    const result = $('predictionResult');
-    if (result) result.innerHTML = `<strong>${esc(output.quote)}</strong><span>digit ${output.digit} · ${esc(output.direction)} · ${esc(method)}</span><small>Based on ${number(model.actualCount)} actual ticks · model v${model.version}</small>`;
-    const status = $('predictionStatus');
-    if (status) status.textContent = `Prediction generated for ${symbol}. It is not counted as an actual tick until a later Deriv tick is observed.`;
+    renderPrediction(symbol);
     return output;
   }
 
@@ -201,7 +228,7 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
     const now = performance.now();
     if (!force && now - lastRender < 180) { if (!renderTimer) renderTimer = setTimeout(() => { renderTimer = 0; renderAll(true); }, 180); return; }
     lastRender = now;
-    populateSymbolSelects(); renderSymbols(); renderStats(); renderBehavior(); renderLearning(); renderForecasts(); renderGenerator($('generatorSymbol')?.value || getSelected()); renderExplorer(); renderDiagnostics();
+    populateSymbolSelects(); renderSymbols(); renderStats(); renderBehavior(); renderLearning(); renderForecasts(); renderGenerator($('generatorSymbol')?.value || getSelected()); renderPrediction($('predictionSymbol')?.value || getSelected()); renderExplorer(); renderDiagnostics();
   }
   function populateSymbolSelects() {
     const symbols = getSymbols();
@@ -296,6 +323,19 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
     else if (latest) showGeneratorStatus(`${getConnected() ? 'LIVE-LEARNING' : 'OFFLINE SIMULATION'} · ${latest.method === 'stress' ? 'PATTERN STRESS' : 'MIMIC'} · ${number(droppedGenerationRequests)} queued intervals skipped`);
     $('generatedCount').textContent = number(generatedTotal);
   }
+  function renderPrediction(symbol) {
+    const live = liveMimic.get(symbol), actual = trainingData.get(symbol)?.at(-1) || getActualTicks(symbol)?.at(-1), model = models.get(symbol);
+    if (!$('predictionActual')) return;
+    $('predictionActual').textContent = actual?.digit ?? finalDigit(actual?.quote) ?? '—';
+    $('predictionActualQuote').textContent = actual?.quote || 'Waiting for live tick';
+    $('predictionNextDigit').textContent = live?.path?.[0]?.digit ?? '—';
+    $('predictionModelState').textContent = model ? `${model.status} · ${number(model.actualCount)} actual ticks · model v${model.version}` : 'Waiting for training data';
+    const evaluated = live?.evaluated || 0, accuracy = evaluated ? live.correct / evaluated : null;
+    $('predictionAccuracy').textContent = Number.isFinite(accuracy) ? `${(accuracy * 100).toFixed(1)}%` : '—';
+    $('predictionSamples').textContent = `${number(evaluated)} scored next-tick predictions`;
+    $('predictionOutcome').textContent = live?.lastOutcome ? `${live.lastOutcome.correct ? 'Correct digit' : 'Missed digit'} · actual ${live.lastOutcome.actualDigit} · predicted ${live.lastPrediction?.digit}` : 'Waiting for the next actual tick to score the first prediction';
+    $('predictionPath').innerHTML = (live?.path || []).map((item, index) => `<span class="prediction-digit-chip ${index === 0 ? 'next' : ''}"><b>${item.digit}</b><small>+${index + 1}</small></span>`).join('') || '<span class="empty-copy">Need at least 10 actual ticks.</span>';
+  }
   function renderExplorer() {
     if (!$('explorerRows')) return;
     const selected = getSelected(), symbol = $('filterSymbol')?.value || selected, source = $('filterSource')?.value || 'actual';
@@ -333,6 +373,9 @@ export function createResearchWorkspace({ getActualTicks, getSymbols, getConnect
   $('generatorSymbol')?.addEventListener('change', e => { renderGenerator(e.target.value); if (started && generatorWorker) initializeWorker(e.target.value); }); $('generationRate')?.addEventListener('change', () => { if (started && !paused) { clearInterval(timer); timer = 0; started = false; startGenerator(); } });
   $('issueForecast')?.addEventListener('click', () => { try { issueForecast($('forecastSymbol').value || getSelected(), Number($('forecastHorizon').value), $('forecastModel').value === 'baseline' ? 'baseline' : 'markov'); } catch (error) { window.alert(error.message); } });
   $('predictNext')?.addEventListener('click', () => { try { predictNext($('predictionSymbol').value || getSelected(), $('predictionModel').value || 'markov'); } catch (error) { window.alert(error.message); } });
+  $('predictionModel')?.addEventListener('change', () => { const symbol = $('predictionSymbol')?.value || getSelected(); const model = models.get(symbol); const actual = trainingData.get(symbol) || getActualTicks(symbol) || []; if (model) prepareLiveMimic(symbol, model, actual); renderPrediction(symbol); });
+  $('predictionHorizon')?.addEventListener('change', () => { const symbol = $('predictionSymbol')?.value || getSelected(); const model = models.get(symbol); const actual = trainingData.get(symbol) || getActualTicks(symbol) || []; if (model) prepareLiveMimic(symbol, model, actual); renderPrediction(symbol); });
+  $('predictionSymbol')?.addEventListener('change', event => renderPrediction(event.target.value));
   for (const id of ['filterSymbol', 'filterSource', 'filterDigit', 'filterDirection', 'filterSearch', 'filterFrom', 'filterTo', 'filterPrediction']) $(id)?.addEventListener('input', renderExplorer);
   $('saveSettings')?.addEventListener('click', async () => {
     const windows = $('rollingWindows').value.split(',').map(x => Number(x.trim())).filter(x => Number.isInteger(x) && x >= 10 && x <= 10000);

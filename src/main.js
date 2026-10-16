@@ -232,6 +232,11 @@ function chooseSymbol(symbol) {
     generatorSelect.value = symbol;
     generatorSelect.dispatchEvent(new Event('change'));
   }
+  const predictionSelect = $('predictionSymbol');
+  if (predictionSelect) {
+    predictionSelect.value = symbol;
+    predictionSelect.dispatchEvent(new Event('change'));
+  }
   $('selectedName').textContent = state.symbols.find(s => s.symbol === symbol)?.display_name || symbol;
   $('recordsTitle').textContent = `${state.symbols.find(s => s.symbol === symbol)?.display_name || symbol} · recent quotes`;
   renderSymbols(); renderSelected();
